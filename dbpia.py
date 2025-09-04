@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-#dbpia사이트에서 키워드를 기반으로 크롤링 해오는 코드 
-#sommizzu
+
 # 필요한 라이브러리들을 가져옵니다 (import = 가져오기)
 from selenium import webdriver  # 웹 브라우저를 자동으로 조작하는 도구
 from selenium.webdriver.chrome.service import Service  # 크롬 브라우저 서비스
@@ -15,6 +14,161 @@ from datetime import datetime  # 현재 날짜/시간 가져오기
 import os  # 파일 시스템 관련 기능
 import logging  # 로그(기록) 관리
 import json  # JSON 데이터 처리
+import threading  # 멀티스레딩
+from concurrent.futures import ThreadPoolExecutor  # 스레드 풀
+import queue  # 스레드 간 데이터 전달
+
+def process_single_paper(link_data, thread_id, results_queue, filename):
+    """단일 논문 처리 함수 (병렬 처리용)"""
+    link, idx = link_data
+    
+    # 각 스레드마다 독립적인 브라우저 인스턴스 생성
+    chrome_options = Options()
+    chrome_options.add_argument('--no-sandbox')
+    chrome_options.add_argument('--disable-dev-shm-usage')
+    chrome_options.add_argument('--disable-gpu')
+    chrome_options.add_argument('--disable-extensions')
+    chrome_options.add_argument('--disable-logging')
+    chrome_options.add_argument('--disable-web-security')
+    chrome_options.add_argument('--disable-features=VizDisplayCompositor')
+    chrome_options.add_argument('--log-level=3')
+    chrome_options.add_experimental_option('excludeSwitches', ['enable-logging'])
+    chrome_options.add_experimental_option('useAutomationExtension', False)
+    
+    service = Service(ChromeDriverManager().install())
+    service.log_path = os.devnull
+    browser = webdriver.Chrome(service=service, options=chrome_options)
+    
+    try:
+        print(f"🔄 스레드 {thread_id}: 논문 {idx} 처리 중...")
+        browser.get(link)
+        time.sleep(2)
+        
+        # JSON-LD 데이터에서 정보 추출
+        json_ld_data = None
+        try:
+            json_ld_script = browser.find_element(By.XPATH, "//script[@type='application/ld+json']")
+            json_ld_data = json.loads(json_ld_script.get_attribute('innerHTML'))
+        except:
+            pass
+        
+        # 논문 제목
+        title = "제목 없음"
+        if json_ld_data and 'headline' in json_ld_data:
+            title = json_ld_data['headline']
+        else:
+            try:
+                title = browser.find_element(By.CLASS_NAME, 'thesis__title').text.strip()
+            except:
+                pass
+        
+        # 논문 저자
+        author = "저자 없음"
+        if json_ld_data and 'author' in json_ld_data:
+            if isinstance(json_ld_data['author'], list):
+                author = ', '.join([author_item.get('name', '') if isinstance(author_item, dict) else str(author_item) for author_item in json_ld_data['author']])
+            elif isinstance(json_ld_data['author'], dict):
+                author = json_ld_data['author'].get('name', '')
+            else:
+                author = str(json_ld_data['author'])
+        else:
+            try:
+                author = browser.find_element(By.CLASS_NAME, 'thesis__author').text.strip()
+            except:
+                pass
+        
+        # 논문 초록
+        abstract = "초록 없음"
+        try:
+            abstract = browser.find_element(By.CLASS_NAME, 'abstractTxt').text.strip()
+        except:
+            pass
+        
+        # 발행년도
+        year = "년도 없음"
+        if json_ld_data and 'datePublished' in json_ld_data:
+            year = json_ld_data['datePublished'][:4]
+        else:
+            try:
+                year_element = browser.find_element(By.CLASS_NAME, 'thesis__year')
+                year = year_element.text.strip()
+            except:
+                pass
+        
+        # 학술지명
+        journal = "학술지 없음"
+        if json_ld_data and 'isPartOf' in json_ld_data:
+            if isinstance(json_ld_data['isPartOf'], dict):
+                journal = json_ld_data['isPartOf'].get('name', '')
+            else:
+                journal = str(json_ld_data['isPartOf'])
+        else:
+            try:
+                journal = browser.find_element(By.CLASS_NAME, 'thesis__journal').text.strip()
+            except:
+                pass
+        
+        # 수록면 정보
+        page_info = "수록면 정보 없음"
+        if json_ld_data and 'pagination' in json_ld_data:
+            if isinstance(json_ld_data['pagination'], dict):
+                page_start = json_ld_data['pagination'].get('pageStart', '')
+                page_end = json_ld_data['pagination'].get('pageEnd', '')
+                if page_start:
+                    page_info = page_start
+                    if page_end:
+                        page_info += f"-{page_end}"
+            else:
+                page_info = str(json_ld_data['pagination'])
+        else:
+            try:
+                page_selectors = ['thesis__page', 'thesis__pages', 'page-info', 'thesis__volume', 'thesis__issue']
+                for selector in page_selectors:
+                    try:
+                        page_element = browser.find_element(By.CLASS_NAME, selector)
+                        page_info = page_element.text.strip()
+                        if page_info:
+                            break
+                    except:
+                        continue
+            except:
+                pass
+        
+        # 데이터 정리
+        paper_info = {
+            '번호': idx,
+            '제목': title,
+            '저자': author,
+            '학술지': journal,
+            '발행년도': year,
+            '수록면': page_info,
+            '초록': abstract,
+            '링크': link,
+            '크롤링날짜': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        }
+        
+        # 결과를 큐에 전달
+        results_queue.put(paper_info)
+        print(f"✅ 스레드 {thread_id}: {title[:30]}... 완료!")
+        
+    except Exception as e:
+        print(f"❌ 스레드 {thread_id}: 논문 {idx} 처리 실패: {e}")
+        # 오류 발생 시 기본 정보 저장
+        paper_info = {
+            '번호': idx,
+            '제목': '처리 실패',
+            '저자': '처리 실패',
+            '학술지': '처리 실패',
+            '발행년도': '처리 실패',
+            '수록면': '처리 실패',
+            '초록': '처리 실패',
+            '링크': link,
+            '크롤링날짜': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        }
+        results_queue.put(paper_info)
+        
+    finally:
+        browser.quit()
 
 def crawl_dbpia_papers():
     """DBPIA 논문 크롤링 메인 함수"""
@@ -163,163 +317,51 @@ def crawl_dbpia_papers():
             print("❌ 수집된 논문 링크가 없습니다. 검색어를 변경하거나 사이트 구조를 확인해주세요.")
             return None, []
         
-        # 각 논문 상세 정보 수집 (실시간 저장!)
-        for idx, link in enumerate(link_list, 1):
-            print(f"📖 논문 {idx}/{len(link_list)} 처리 중...")
+        # 병렬 처리로 논문 상세 정보 수집! 🚀
+        print(f"🚀 병렬 처리 시작! (최대 4개 스레드)")
+        
+        # 스레드 풀 생성 (최대 4개 스레드)
+        max_workers = min(4, len(link_list))  # 논문 수가 적으면 스레드 수도 조정
+        results_queue = queue.Queue()
+        
+        # 링크 데이터 준비
+        link_data_list = [(link, idx) for idx, link in enumerate(link_list, 1)]
+        
+        # ThreadPoolExecutor로 병렬 처리
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # 모든 작업 제출
+            futures = []
+            for i, link_data in enumerate(link_data_list):
+                future = executor.submit(process_single_paper, link_data, i+1, results_queue, filename)
+                futures.append(future)
             
-            try:
-                browser.get(link)
-                time.sleep(2)
-                
-                # JSON-LD 데이터에서 정보 추출 (가장 안정적)
-                json_ld_data = None
+            # 결과 수집 (실시간)
+            completed_count = 0
+            while completed_count < len(link_list):
                 try:
-                    json_ld_script = browser.find_element(By.XPATH, "//script[@type='application/ld+json']")
-                    json_ld_data = json.loads(json_ld_script.get_attribute('innerHTML'))
-                except:
-                    pass
-                
-                # 논문 제목
-                title = "제목 없음"
-                if json_ld_data and 'headline' in json_ld_data:
-                    title = json_ld_data['headline']
-                else:
-                    try:
-                        title = browser.find_element(By.CLASS_NAME, 'thesis__title').text.strip()
-                    except:
-                        pass
-                
-                # 중복 제목 체크
-                if title != "제목 없음" and title in processed_titles:
-                    print(f"⚠️ 중복 논문 제외: {title[:50]}...")
+                    # 큐에서 결과 가져오기 (타임아웃 1초)
+                    paper_info = results_queue.get(timeout=1)
+                    paper_data.append(paper_info)
+                    completed_count += 1
+                    
+                    # 실시간 CSV 저장
+                    df = pd.DataFrame(paper_data)
+                    df.to_csv(filename, index=False, encoding='utf-8-sig')
+                    
+                    print(f"😺 진행률: {completed_count}/{len(link_list)} ({completed_count/len(link_list)*100:.1f}%)")
+                    
+                except queue.Empty:
+                    # 타임아웃 발생 시 계속 대기
                     continue
-                
-                if title != "제목 없음":
-                    processed_titles.add(title)
-                
-                # 논문 저자
-                author = "저자 없음"
-                if json_ld_data and 'author' in json_ld_data:
-                    if isinstance(json_ld_data['author'], list):
-                        author = ', '.join([author_item.get('name', '') if isinstance(author_item, dict) else str(author_item) for author_item in json_ld_data['author']])
-                    elif isinstance(json_ld_data['author'], dict):
-                        author = json_ld_data['author'].get('name', '')
-                    else:
-                        author = str(json_ld_data['author'])
-                else:
-                    try:
-                        author = browser.find_element(By.CLASS_NAME, 'thesis__author').text.strip()
-                    except:
-                        pass
-                
-                # 논문 초록
-                abstract = "초록 없음"
-                try:
-                    abstract = browser.find_element(By.CLASS_NAME, 'abstractTxt').text.strip()
-                except:
-                    pass
-                
-                # 발행년도
-                year = "년도 없음"
-                if json_ld_data and 'datePublished' in json_ld_data:
-                    year = json_ld_data['datePublished'][:4]  # YYYY-MM-DD에서 YYYY만 추출
-                else:
-                    try:
-                        year_element = browser.find_element(By.CLASS_NAME, 'thesis__year')
-                        year = year_element.text.strip()
-                    except:
-                        pass
-                
-                # 학술지명
-                journal = "학술지 없음"
-                if json_ld_data and 'isPartOf' in json_ld_data:
-                    if isinstance(json_ld_data['isPartOf'], dict):
-                        journal = json_ld_data['isPartOf'].get('name', '')
-                    else:
-                        journal = str(json_ld_data['isPartOf'])
-                else:
-                    try:
-                        journal = browser.find_element(By.CLASS_NAME, 'thesis__journal').text.strip()
-                    except:
-                        pass
-                
-                # 수록면 정보
-                page_info = "수록면 정보 없음"
-                if json_ld_data and 'pagination' in json_ld_data:
-                    if isinstance(json_ld_data['pagination'], dict):
-                        page_start = json_ld_data['pagination'].get('pageStart', '')
-                        page_end = json_ld_data['pagination'].get('pageEnd', '')
-                        if page_start:
-                            page_info = page_start
-                            if page_end:
-                                page_info += f"-{page_end}"
-                    else:
-                        page_info = str(json_ld_data['pagination'])
-                else:
-                    try:
-                        page_selectors = [
-                            'thesis__page',
-                            'thesis__pages',
-                            'page-info',
-                            'thesis__volume',
-                            'thesis__issue'
-                        ]
-                        
-                        for selector in page_selectors:
-                            try:
-                                page_element = browser.find_element(By.CLASS_NAME, selector)
-                                page_info = page_element.text.strip()
-                                if page_info:
-                                    break
-                            except:
-                                continue
-                    except:
-                        pass
-                
-                # 데이터 정리
-                paper_info = {
-                    '번호': idx,
-                    '제목': title,
-                    '저자': author,
-                    '학술지': journal,
-                    '발행년도': year,
-                    '수록면': page_info,
-                    '초록': abstract,
-                    '링크': link,
-                    '크롤링날짜': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                }
-                
-                paper_data.append(paper_info)
-                
-                # 실시간 CSV 저장
-                df = pd.DataFrame(paper_data)
-                df.to_csv(filename, index=False, encoding='utf-8-sig')
-                print(f"✅ {title[:50]}... (CSV 저장 완료!)")
-                
-            except Exception as e:
-                print(f"❌ 논문 {idx} 처리 실패: {e}")
-                # 오류 발생 시 기본 정보 저장
-                paper_data.append({
-                    '번호': idx,
-                    '제목': '처리 실패',
-                    '저자': '처리 실패',
-                    '학술지': '처리 실패',
-                    '발행년도': '처리 실패',
-                    '수록면': '처리 실패',
-                    '초록': '처리 실패',
-                    '링크': link,
-                    '크롤링날짜': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                })
-                
-                # 실시간 CSV 저장
-                df = pd.DataFrame(paper_data)
-                df.to_csv(filename, index=False, encoding='utf-8-sig')
-                print(f"⚠️ 논문 {idx} 처리 실패했지만 CSV에 저장됨")
+            
+            # 모든 작업 완료 대기
+            for future in futures:
+                future.result()
         
         # 크롤링 완료 결과 출력
         print(f"\n🎉 === 크롤링 완료! ===")
         print(f"📁 파일명: {filename}")
-        print(f"📊 총 논문 수: {len(paper_data)}")
+        print(f"😺 총 논문 수: {len(paper_data)}")
         print(f"💾 저장 위치: {os.path.abspath(filename)}")
         
         # 수집된 논문 목록 미리보기
@@ -346,7 +388,6 @@ def crawl_dbpia_papers():
         browser.quit()
 
 def main():
-    """메인 실행 함수"""
     print("=" * 50)
     print("🎓 DBPIA 논문 크롤링 프로그램")
     print("=" * 50)
